@@ -1,216 +1,219 @@
-import asyncio, httpx, statistics, logging
-from helpers.geocoder import geocode_address
+"""
+tools/analyze_parcel.py v4 — Parallélisme total, timeout agressif, DVF multi-source
+"""
+import asyncio, logging, time, math, io, csv, gzip, os
+import httpx
+
 logger = logging.getLogger(__name__)
 
-# Timeouts individuels par source (secondes)
-T_FAST = 6   # BAN, Cadastre, Risques, Commune
-T_SLOW = 10  # PLU GPU (lent), DPE ADEME, Batiments
-T_DVF  = 5   # DVF (souvent bloqué)
-
-async def _safe(coro):
-    """Wrapper qui retourne {} en cas d'erreur."""
-    try: return await coro
-    except Exception as e: return {"erreur": str(e)[:80]}
-
-async def _cad(lat, lon, insee):
-    async with httpx.AsyncClient(timeout=T_FAST, follow_redirects=True,
-            headers={"User-Agent":"LexFoncier/2.0"}) as c:
-        r = await c.get("https://apicarto.ign.fr/api/cadastre/parcelle",
-            params={"lon":lon,"lat":lat,"code_insee":insee,"_limit":5})
-        if r.status_code != 200: return {"erreur":"IGN "+str(r.status_code)}
-        feats = r.json().get("features",[])
-        if not feats: return {"erreur":"Aucune parcelle"}
-        p = feats[0]["properties"]
-        return {
-            "reference":(p.get("codecom","")+p.get("section","").strip()+p.get("numero","")).upper(),
-            "section":p.get("section","").strip(), "numero":p.get("numero",""),
-            "surface_m2":p.get("contenance",0),
-            "surface_ha":round(p.get("contenance",0)/10000,4) if p.get("contenance") else 0,
-            "commune":p.get("nomcom",""), "code_dep":p.get("coddep",""), "code_insee":insee,
-            "toutes_parcelles":[{"ref":f["properties"].get("section","").strip()+f["properties"].get("numero",""),
-                "surf_m2":f["properties"].get("contenance",0)} for f in feats],
-            "source":"IGN — API Carto / Cadastre","licence":"Licence Ouverte Etalab v2.0"}
-
-async def _bat(lat, lon):
-    async with httpx.AsyncClient(timeout=T_SLOW, follow_redirects=True,
-            headers={"User-Agent":"LexFoncier/2.0"}) as c:
-        bbox = f"{lat-0.002},{lon-0.003},{lat+0.002},{lon+0.003}"
-        r = await c.get("https://data.geopf.fr/wfs/ows", params={
-            "SERVICE":"WFS","VERSION":"2.0.0","REQUEST":"GetFeature",
-            "TYPENAMES":"BDTOPO_V3:batiment","CRS":"EPSG:4326","BBOX":bbox,
-            "outputformat":"application/json","count":8,
-            "PROPERTYNAME":"usage_1,usage_2,hauteur,nombre_de_logements,nombre_d_etages,etat_de_l_objet"})
-        if r.status_code != 200: return {"erreur":"BDTOPO "+str(r.status_code)}
-        feats = r.json().get("features",[])
-        bats=[{"usage":f["properties"].get("usage_1",""),
-            "nb_logements":f["properties"].get("nombre_de_logements",0),
-            "nb_etages":f["properties"].get("nombre_d_etages",0),
-            "hauteur_m":f["properties"].get("hauteur",0),
-            "etat":f["properties"].get("etat_de_l_objet","")} for f in feats]
-        return {"batiments":bats,"nb_batiments":len(feats),
-            "nb_avec_logements":len([b for b in bats if b["nb_logements"]]),
-            "source":"IGN — BDTOPO v3","licence":"Licence Ouverte Etalab v2.0"}
-
-async def _dvf(lat, lon, radius=500):
-    try:
-        async with httpx.AsyncClient(timeout=T_DVF, follow_redirects=True) as c:
-            for dist in [radius, min(radius*2,2000)]:
-                try:
-                    r = await c.get(f"https://api.dvf.etalab.gouv.fr/geoapi/mutations?lat={lat}&lon={lon}&dist={dist}")
-                    if r.status_code==200:
-                        ventes=r.json().get("features",[])
-                        if ventes: return _parse_dvf(ventes,dist)
-                except Exception: break
-        return {"disponible":False,"ventes":[],"stats":{},"lien_direct":f"https://dvf.etalab.gouv.fr/?lat={lat}&lon={lon}&zoom=17",
-            "message":"DVF disponible sur dvf.etalab.gouv.fr","source":"DGFiP — DVF","licence":"Licence Ouverte Etalab v2.0"}
-    except Exception as e: return {"erreur":str(e),"ventes":[],"stats":{}}
-
-def _parse_dvf(ventes,radius):
-    parsed=[]
-    for v in ventes:
-        p=v["properties"]; surf=p.get("sbati") or p.get("sterr") or 1; val=p.get("valeurfonc",0) or 0
-        parsed.append({"date":p.get("datemut",""),"valeur_euros":int(val),
-            "surface_bati_m2":p.get("sbati",0) or 0,"surface_terrain_m2":p.get("sterr",0) or 0,
-            "prix_m2":round(val/surf) if val and surf>0 else 0,
-            "type_bien":p.get("libtypbien",""),"nature_mutation":p.get("libnatmut",""),
-            "commune":p.get("nomcom","")})
-    parsed.sort(key=lambda x:x["date"],reverse=True)
-    pm2=[v["prix_m2"] for v in parsed if v["prix_m2"]>100]
-    vals=[v["valeur_euros"] for v in parsed if v["valeur_euros"]>0]
-    stats={"prix_m2_median":int(statistics.median(pm2)),"prix_m2_moyen":int(statistics.mean(pm2)),
-        "prix_m2_min":min(pm2),"prix_m2_max":max(pm2),"nb_transactions":len(pm2),
-        "valeur_mediane":int(statistics.median(vals)) if vals else 0,
-        "periode":min(v["date"] for v in parsed if v["date"])[:7]+" à "+max(v["date"] for v in parsed if v["date"])[:7]} if pm2 else {}
-    return {"disponible":True,"ventes":parsed[:20],"ventes_logements":[v for v in parsed if v["surface_bati_m2"]>0][:12],
-        "stats":stats,"count_total":len(ventes),"rayon_m":radius,"source":"DGFiP — DVF","licence":"Licence Ouverte Etalab v2.0"}
-
-async def _plu(lat, lon):
-    async with httpx.AsyncClient(timeout=T_SLOW, follow_redirects=True,
-            headers={"User-Agent":"LexFoncier/2.0"}) as c:
-        r = await c.get("https://apicarto.ign.fr/api/gpu/zone-urba",params={"lon":lon,"lat":lat,"_limit":5})
-        if r.status_code!=200: return {"erreur":"GPU "+str(r.status_code)}
-        feats=r.json().get("features",[])
-        if not feats: return {"erreur":"Aucune zone PLU"}
-        r2 = await c.get("https://apicarto.ign.fr/api/gpu/document",params={"lon":lon,"lat":lat})
-        doc=r2.json().get("features",[{}])[0].get("properties",{}) if r2.status_code==200 else {}
-        z=feats[0]["properties"]; tz=z.get("typezone","")
-        if tz.startswith("U"): ct,dt="Constructible","Zone urbaine "+tz+" — Construction autorisée sous conditions PLU"
-        elif tz.startswith("AU"): ct,dt="À urbaniser","Zone AU — Ouverture à l'urbanisation possible"
-        elif tz.startswith("A"): ct,dt="Zone agricole","Zone A — Construction très limitée"
-        elif tz.startswith("N"): ct,dt="Zone naturelle","Zone N — Construction interdite sauf exceptions"
-        else: ct,dt="À vérifier","Zone "+tz+" — Consulter le règlement"
-        return {"zone_principale":z.get("libelle",tz),"libelle_long":z.get("libelong",""),
-            "type_zone":tz,"constructibilite":ct,"constructibilite_detail":dt,
-            "toutes_zones":[{"libelle":f["properties"].get("libelle",""),"type":f["properties"].get("typezone",""),
-                "lien":f["properties"].get("urlfic","")} for f in feats],
-            "document_urbanisme":{"type":doc.get("typedoc",""),"etat":doc.get("etat",""),
-                "date_approbation":doc.get("datappro",""),"commune":doc.get("nomcom",""),
-                "lien_reglement":z.get("urlfic",""),"id_urbanisme":z.get("idurba","")},
-            "source":"Géoportail Urbanisme — IGN","licence":"Licence Ouverte Etalab v2.0"}
-
-async def _risks(lat, lon, code_insee=""):
-    async with httpx.AsyncClient(timeout=T_FAST, follow_redirects=True) as c:
-        res={"risques_gaspar":[],"nb_risques":0}
-        r=await c.get("https://georisques.gouv.fr/api/v1/gaspar/risques",params={"latlon":f"{lon},{lat}","rayon":1000})
-        if r.status_code==200:
-            risques=[{"code_risque":z.get("codeRisque",""),"libelle":z.get("libelleRisque",""),"commune":z.get("libelle","")}
-                for z in r.json().get("data",[])]
-            res["risques_gaspar"]=risques; res["nb_risques"]=len(risques)
-        # Inondations, argiles, radon en parallèle interne
-        r2,r3=await asyncio.gather(
-            c.get("https://georisques.gouv.fr/api/v1/zonages_inondations",params={"latlon":f"{lon},{lat}","rayon":500}),
-            c.get("https://georisques.gouv.fr/api/v1/retrait_gonflement_argiles",params={"latlon":f"{lon},{lat}","rayon":200}))
-        if r2.status_code==200:
-            zones=r2.json().get("data",[])
-            res["inondation"]={"present":len(zones)>0,"nb_zones":len(zones),
-                "zones":[{"libelle":z.get("libelle",""),"type":z.get("typeAlea","")} for z in zones[:3]]}
-        if r3.status_code==200:
-            za=r3.json().get("data",[])
-            if za: res["argiles"]={"exposition":za[0].get("libelleExposition","Non renseigné")}
-        if code_insee:
-            try:
-                r4=await c.get("https://georisques.gouv.fr/api/v1/radon",params={"code_insee":code_insee})
-                if r4.status_code==200:
-                    rad=r4.json().get("data",[])
-                    if rad: res["radon"]={"classe":rad[0].get("classeRadon",""),"libelle":rad[0].get("libelleClasse","")}
-            except Exception: pass
-        res["source"]="Géorisques — BRGM"; res["licence"]="Licence Ouverte Etalab v2.0"
-        return res
-
-async def _dpe(lat, lon, dep):
-    async with httpx.AsyncClient(timeout=T_SLOW, follow_redirects=True) as c:
-        d2=str(dep).zfill(2) if dep else "69"
-        r=await c.get(f"https://data.ademe.fr/data-fair/api/v1/datasets/dpe-{d2}/lines",
-            params={"geo_distance":f"{lon},{lat},300","size":15,
-                "select":"numero_dpe,date_etablissement_dpe,classe_consommation_energie,classe_estimation_ges,consommation_energie,estimation_ges,surface_habitable,annee_construction,commune,code_postal,numero_rue,nom_rue,tr002_type_batiment_id",
-                "sort":"-date_etablissement_dpe"})
-        if r.status_code!=200: return {"erreur":"DPE HTTP "+str(r.status_code),"dpe_adresse":[]}
-        d=r.json(); dpes=d.get("results",[])
-        TYPES={1:"Maison",2:"Appartement",3:"Immeuble",4:"Local commercial"}
-        return {"dpe_adresse":[{"numero":dp.get("numero_dpe",""),"date":dp.get("date_etablissement_dpe",""),
-            "etiquette_dpe":dp.get("classe_consommation_energie",""),
-            "etiquette_ges":dp.get("classe_estimation_ges",""),
-            "conso_energie_kwh":dp.get("consommation_energie",0),
-            "emission_ges":dp.get("estimation_ges",0),
-            "type_batiment":TYPES.get(dp.get("tr002_type_batiment_id"),str(dp.get("tr002_type_batiment_id",""))),
-            "annee_construction":dp.get("annee_construction",0),
-            "surface_m2":dp.get("surface_habitable",0),
-            "adresse":str(dp.get("numero_rue",""))+" "+str(dp.get("nom_rue","")),
-            "commune":dp.get("commune",""),"code_postal":dp.get("code_postal",""),
-            "distance_m":round(dp.get("_geo_distance",0))} for dp in dpes],
-            "nb_dpe_proches":len(dpes),"total_commune":d.get("total",0),
-            "source":"ADEME — DPE dep "+d2,"licence":"Licence Ouverte Etalab v2.0"}
-
-async def _ban_rev(lat, lon):
-    async with httpx.AsyncClient(timeout=T_FAST, follow_redirects=True,
-            headers={"User-Agent":"LexFoncier/2.0"}) as c:
-        r=await c.get("https://api-adresse.data.gouv.fr/reverse/",params={"lon":lon,"lat":lat})
-        if r.status_code!=200 or not r.text.strip(): return {}
-        feats=r.json().get("features",[])
-        if not feats: return {}
-        p=feats[0]["properties"]; ctx=p.get("context","")
-        parts=[x.strip() for x in ctx.split(",")]
-        return {"adresse_complete":p.get("label",""),"numero":p.get("housenumber",""),
-            "rue":p.get("street",p.get("name","")),"code_postal":p.get("postcode",""),
-            "commune":p.get("city",""),"code_insee":p.get("citycode",""),
-            "departement":parts[0] if parts else "","region":parts[-1] if len(parts)>1 else ""}
-
-async def _commune(insee):
-    async with httpx.AsyncClient(timeout=T_FAST, follow_redirects=True) as c:
-        r=await c.get(f"https://geo.api.gouv.fr/communes/{insee}",
-            params={"fields":"nom,codeDepartement,codeRegion,population,surface,codesPostaux"})
-        if r.status_code!=200: return {}
-        d=r.json()
-        return {"nom":d.get("nom",""),"departement":d.get("codeDepartement",""),
-            "region":d.get("codeRegion",""),"population":d.get("population",0),
-            "surface_km2":round(d.get("surface",0)/100,1) if d.get("surface") else 0,
-            "codes_postaux":d.get("codesPostaux",[])}
-
 async def analyze_parcel(address: str, dvf_radius: int = 500) -> dict:
-    """Analyse foncière complète — 8 sources officielles en parallèle."""
-    import time; t0=time.time()
-    try: geo=await geocode_address(address)
-    except Exception as e: return {"success":False,"erreur":"Géocodage impossible: "+str(e),"address":address}
-    lat,lon=geo["lat"],geo["lon"]
-    citycode=geo["citycode"]; cc=geo["citycode_cadastre"]
-    dep=geo.get("department","69").split(",")[0].strip()[:2]
-    # 8 sources en parallèle avec timeouts individuels
-    cad,bat,dvf,plu,risks,dpe,ban,com = await asyncio.gather(
-        _safe(_cad(lat,lon,cc)),
-        _safe(_bat(lat,lon)),
-        _safe(_dvf(lat,lon,dvf_radius)),
-        _safe(_plu(lat,lon)),
-        _safe(_risks(lat,lon,cc)),
-        _safe(_dpe(lat,lon,dep)),
-        _safe(_ban_rev(lat,lon)),
-        _safe(_commune(cc)))
-    return {"success":True,
-        "meta":{"address_input":address,"address_normalized":geo["label"],
-            "geocoding_score":geo["score"],"coordinates":{"lat":lat,"lon":lon},
-            "commune":geo["city"],"code_postal":geo["postcode"],
-            "code_insee":citycode,"code_insee_cadastre":cc,
-            "departement":geo.get("department",""),"region":geo.get("region",""),
-            "temps_secondes":round(time.time()-t0,2),
-            "sources":["BAN","IGN Cadastre","IGN Bâtiments","DVF DGFiP","GPU PLU","Géorisques","DPE ADEME","INSEE Géo"]},
-        "adresse":ban,"cadastre":cad,"batiments":bat,
-        "dvf":dvf,"plu":plu,"risks":risks,"dpe":dpe,"commune":com}
+    t0 = time.time()
+    geo = await _geocode(address)
+    if not geo:
+        return {"success":False,"erreur":f"Adresse introuvable: {address}","address":address}
+    lat, lon = geo["lat"], geo["lon"]
+    code_insee = geo.get("code_insee","")
+    tasks = await asyncio.gather(
+        _cadastre(lat, lon),
+        _plu(lat, lon),
+        _dvf_multi(lat, lon, dvf_radius, code_insee),
+        _risks(lat, lon),
+        _dpe(lat, lon, code_insee),
+        _batiments(lat, lon),
+        _commune(code_insee),
+        return_exceptions=True
+    )
+    keys = ["cadastre","plu","dvf","risks","dpe","batiments","commune"]
+    result = {"success":True,"meta":{
+        "address_input":address,"address_normalized":geo.get("label",address),
+        "geocoding_score":geo.get("score",0),"coordinates":{"lat":lat,"lon":lon},
+        "code_insee":code_insee,"temps_secondes":round(time.time()-t0,1)
+    }}
+    for k,v in zip(keys,tasks):
+        result[k] = v if not isinstance(v,Exception) else {"erreur":str(v)[:80]}
+    return result
+
+async def _geocode(address: str) -> dict | None:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get("https://api-adresse.data.gouv.fr/search/",params={"q":address,"limit":1})
+            features = r.json().get("features",[])
+            if not features: return None
+            f=features[0]; props=f.get("properties",{}); coords=f.get("geometry",{}).get("coordinates",[0,0])
+            return {"lat":coords[1],"lon":coords[0],"label":props.get("label",""),
+                "score":props.get("score",0),"code_insee":props.get("citycode",""),
+                "postcode":props.get("postcode",""),"city":props.get("city","")}
+    except: return None
+
+async def _cadastre(lat, lon) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r = await c.get("https://apicarto.ign.fr/api/cadastre/parcelle",params={"lon":lon,"lat":lat,"_limit":1})
+            if r.status_code!=200: return {"erreur":f"IGN {r.status_code}"}
+            feats=r.json().get("features",[])
+            if not feats: return {"erreur":"Parcelle non trouvée"}
+            p=feats[0].get("properties",{})
+            return {"reference":f"{p.get('codecommune','')}{p.get('section','')}{p.get('numero','')}",
+                "section":p.get("section",""),"numero":p.get("numero",""),
+                "surface_m2":p.get("contenance"),"code_insee":p.get("codecommune",""),"source":"IGN API Carto"}
+    except Exception as e: return {"erreur":str(e)[:80]}
+
+async def _plu(lat, lon) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get("https://apicarto.ign.fr/api/gpu/zone-urba",params={"lon":lon,"lat":lat})
+            if r.status_code!=200: return {"erreur":f"GPU {r.status_code}"}
+            feats=r.json().get("features",[])
+            if not feats: return {"zone_principale":"Non couvert","constructibilite":"Inconnu"}
+            best=feats[0].get("properties",{}); tz=best.get("typezone","")
+            constructible=tz.startswith("U") and not tz.startswith("AU")
+            return {"zone_principale":tz,"libelle":best.get("libelle",""),
+                "constructibilite":"Constructible" if constructible else ("À urbaniser" if tz.startswith("AU") else "Non constructible"),
+                "constructibilite_detail":best.get("libelong",""),
+                "document_urbanisme":{"type":best.get("typedoc",""),"etat":best.get("etat",""),
+                    "date_approbation":best.get("dateappr",""),"lien_reglement":best.get("urlfic","")},
+                "source":"Géoportail Urbanisme — IGN/DGALN"}
+    except Exception as e: return {"erreur":str(e)[:80]}
+
+async def _dvf_multi(lat, lon, radius, code_insee) -> dict:
+    normi_token = os.getenv("NORMI_TOKEN","")
+    if normi_token:
+        r = await _dvf_normi(lat, lon, radius, normi_token)
+        if r.get("success"): return r
+    r = await _dvf_csv(lat, lon, radius, code_insee)
+    if r.get("success"): return r
+    return {"success":False,"disponible":False,
+        "message":"DVF temporairement indisponible.",
+        "lien_direct":f"https://explore.data.gouv.fr/fr/immobilier?lat={lat}&lng={lon}&zoom=16",
+        "source":"DVF — DGFiP"}
+
+async def _dvf_normi(lat, lon, radius, token) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get("https://api.normi.fr/v1/transactions",
+                params={"lat":lat,"lng":lon,"radius":radius,"limit":50},
+                headers={"Authorization":f"Bearer {token}"})
+            if r.status_code!=200: return {"success":False}
+            data=r.json(); transactions=data.get("transactions",data.get("data",[]))
+            if not transactions: return {"success":True,"ventes_logements":[],"stats":{},"count":0,"source":"Normi DVF"}
+            return _build_dvf(transactions, radius, "Normi DVF — DGFiP (certifié)")
+    except Exception as e: logger.debug(f"Normi: {e}"); return {"success":False}
+
+async def _dvf_csv(lat, lon, radius, code_insee) -> dict:
+    if not code_insee or len(code_insee)<5: return {"success":False}
+    dep=code_insee[:2]; 
+    if dep=="97": dep=code_insee[:3]
+    url=f"https://files.data.gouv.fr/geo-dvf/latest/csv/{dep}/communes/{code_insee}.csv.gz"
+    try:
+        async with httpx.AsyncClient(timeout=15.0,follow_redirects=True) as c:
+            r=await c.get(url)
+            if r.status_code!=200: return {"success":False}
+            content=gzip.decompress(r.content).decode("utf-8","replace")
+            rows=list(csv.DictReader(io.StringIO(content)))
+            if not rows: return {"success":True,"ventes_logements":[],"stats":{},"count":0,"source":"DVF CSV"}
+            def dist(la2,lo2):
+                R=6371000; dlat=math.radians(float(la2)-lat); dlon=math.radians(float(lo2)-lon)
+                a=math.sin(dlat/2)**2+math.cos(math.radians(lat))*math.cos(math.radians(float(la2)))*math.sin(dlon/2)**2
+                return R*2*math.atan2(math.sqrt(a),math.sqrt(1-a))
+            ventes,seen=[],set()
+            for row in rows:
+                mid=row.get("id_mutation","")
+                if mid and mid in seen: continue
+                if mid: seen.add(mid)
+                nature=row.get("nature_mutation","Vente")
+                if nature not in ("Vente","Adjudication","Expropriation"): continue
+                la2,lo2=row.get("latitude",""),row.get("longitude","")
+                try:
+                    if la2 and lo2 and dist(la2,lo2)>radius: continue
+                except: pass
+                px_s=row.get("valeur_fonciere","").replace(",",".").replace(" ","")
+                sf_s=row.get("surface_reelle_bati","").replace(",",".")
+                if not px_s: continue
+                try: px=float(px_s); sf=float(sf_s) if sf_s else None
+                except: continue
+                if px<10000 or px>20000000: continue
+                pm2=round(px/sf) if sf and sf>5 else None
+                if pm2 and (pm2<200 or pm2>30000): pm2=None
+                ventes.append({"date":row.get("date_mutation",""),"type_bien":row.get("type_local","Bien"),
+                    "nature":nature,"valeur_euros":int(px),"surface_bati_m2":int(sf) if sf else None,
+                    "prix_m2":pm2,"pieces":row.get("nombre_pieces_principales",""),"code_postal":row.get("code_postal","")})
+            ventes.sort(key=lambda x:x.get("date",""),reverse=True)
+            return _build_dvf(ventes, radius, "DVF CSV — DGFiP / data.gouv.fr (certifié)")
+    except Exception as e: logger.debug(f"DVF CSV: {e}"); return {"success":False}
+
+def _build_dvf(ventes, radius, source):
+    pm2=sorted([v["prix_m2"] for v in ventes if v.get("prix_m2") and v["prix_m2"]>100])
+    stats={}
+    if pm2:
+        mid=len(pm2)//2; dates=[v.get("date","") for v in ventes if v.get("date")]
+        stats={"prix_m2_median":pm2[mid],"prix_m2_moyen":round(sum(pm2)/len(pm2)),
+            "prix_m2_min":pm2[0],"prix_m2_max":pm2[-1],"nb_transactions":len(pm2),
+            "periode":f"{min(dates)[:7]} - {max(dates)[:7]}" if dates else ""}
+    return {"success":True,"disponible":True,"ventes_logements":ventes[:20],"stats":stats,"count":len(ventes),"radius_m":radius,"source":source}
+
+async def _risks(lat, lon) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            rs=await asyncio.gather(
+                c.get(f"https://georisques.gouv.fr/api/v1/gaspar/risques?latlon={lon},{lat}&rayon=500"),
+                c.get(f"https://georisques.gouv.fr/api/v1/radon?lon={lon}&lat={lat}"),
+                c.get(f"https://georisques.gouv.fr/api/v1/zonage_argiles?lon={lon}&lat={lat}"),
+                return_exceptions=True)
+            result={"source":"Géorisques — BRGM"}
+            if not isinstance(rs[0],Exception) and rs[0].status_code==200:
+                d=rs[0].json(); raw=d.get("data",d.get("features",[]))
+                risques=[{"code":r.get("codeRisque",r.get("code_risque","")),"libelle":r.get("libelleRisque",r.get("libelle_risque",r.get("libelle","")))} for r in (raw if isinstance(raw,list) else []) if r.get("libelleRisque") or r.get("libelle")]
+                result["risques_gaspar"]=risques; result["nb_risques"]=len(risques)
+            if not isinstance(rs[1],Exception) and rs[1].status_code==200:
+                d=rs[1].json(); cl=d.get("data",[{}])[0].get("classeRadon","") if d.get("data") else d.get("classe_radon","")
+                if cl: result["radon"]={"classe":str(cl),"libelle":{"1":"Faible","2":"Notable","3":"Élevé"}.get(str(cl),"Cl."+str(cl))}
+            if not isinstance(rs[2],Exception) and rs[2].status_code==200:
+                d=rs[2].json(); exp=d.get("data",[{}])[0].get("exposition","") if d.get("data") else d.get("exposition","")
+                if exp: result["argiles"]={"exposition":exp}
+            return result
+    except Exception as e: return {"erreur":str(e)[:80]}
+
+async def _dpe(lat, lon, code_insee) -> dict:
+    dep=code_insee[:2] if code_insee else "69"
+    if dep=="97" and code_insee: dep=code_insee[:3]
+    slug=f"dpe-{dep}"
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r=await c.get(f"https://data.ademe.fr/data-fair/api/v1/datasets/{slug}/lines",
+                params={"size":8,"sort":"-Date_réception_DPE","geo_distance":f"{lon},{lat},300"})
+            if r.status_code!=200: return {"erreur":f"ADEME {r.status_code}","nb_dpe_proches":0}
+            dpes_raw=r.json().get("results",[])
+            dpes=[{"etiquette_dpe":d.get("Etiquette_DPE",d.get("etiquette_dpe","")),
+                "etiquette_ges":d.get("Etiquette_GES",d.get("etiquette_ges","")),
+                "adresse":d.get("Adresse_(BAN)",d.get("adresse","")),
+                "distance_m":round(float(d.get("_geo_distance",0))) if d.get("_geo_distance") else None}
+                for d in dpes_raw if d.get("Etiquette_DPE") or d.get("etiquette_dpe")]
+            return {"dpe_adresse":dpes,"nb_dpe_proches":len(dpes),"source":f"ADEME DPE dep.{dep}"}
+    except Exception as e: return {"erreur":str(e)[:80],"nb_dpe_proches":0}
+
+async def _batiments(lat, lon) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r=await c.get("https://data.geopf.fr/wfs/ows",params={
+                "SERVICE":"WFS","VERSION":"2.0.0","REQUEST":"GetFeature",
+                "TYPENAMES":"BDTOPO_V3:batiment","COUNT":"10","OUTPUTFORMAT":"application/json","CRS":"CRS:84",
+                "BBOX":f"{lon-0.003},{lat-0.003},{lon+0.003},{lat+0.003},CRS:84"})
+            if r.status_code!=200: return {"erreur":f"BDTOPO {r.status_code}","nb_batiments":0}
+            feats=r.json().get("features",[])
+            bats=[{"usage":p.get("usage_1",p.get("USAGE1","")),"nb_logements":p.get("nombre_logements"),
+                "nb_etages":p.get("nombre_d_etages"),"hauteur":p.get("hauteur"),"etat":p.get("etat_de_l_objet","En service")}
+                for f in feats[:8] for p in [f.get("properties",{})] if p.get("usage_1") or p.get("USAGE1")]
+            return {"batiments":bats,"nb_batiments":len(bats),"nb_avec_logements":sum(1 for b in bats if b.get("nb_logements")),"source":"IGN BDTOPO v3"}
+    except Exception as e: return {"erreur":str(e)[:80],"nb_batiments":0}
+
+async def _commune(code_insee) -> dict:
+    if not code_insee: return {}
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as c:
+            r=await c.get(f"https://geo.api.gouv.fr/communes/{code_insee}",params={"fields":"nom,population,surface,departement,region,codesPostaux"})
+            if r.status_code!=200: return {}
+            d=r.json()
+            return {"nom":d.get("nom",""),"population":d.get("population"),"surface_km2":round(d.get("surface",0)/100,1),
+                "departement":d.get("departement",{}).get("nom",""),"region":d.get("region",{}).get("nom",""),
+                "codes_postaux":d.get("codesPostaux",[]),"source":"INSEE Géo"}
+    except Exception as e: return {"erreur":str(e)[:60]}
